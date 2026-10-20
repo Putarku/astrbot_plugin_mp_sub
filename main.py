@@ -13,11 +13,6 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.core.message.message_event_result import MessageEventResult
-from astrbot.core.utils.session_waiter import (
-    session_waiter,
-    SessionController,
-)
-
 from .api import MoviepilotApi
 
 
@@ -56,8 +51,6 @@ class MoviePilotPlugin(Star):
         QQ 官方机器人（qq_official）原生渲染 Markdown；其他平台（如 aiocqhttp）
         自动剥离 Markdown 语法后以纯文本发送。
         """
-        if event.get_platform_name() == "qq_official":
-            return event.plain_result(text).use_markdown(True)
         plain = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1（\2）", text)
         plain = plain.replace("**", "").replace("`", "")
         plain = re.sub(r"^#+\s*", "", plain, flags=re.MULTILINE)
@@ -79,21 +72,22 @@ class MoviePilotPlugin(Star):
     @filter.command("mp_help")
     async def show_help(self, event: AstrMessageEvent):
         """显示帮助信息"""
-        help_text = """## 📺 MoviePilot 订阅插件
+        help_text = """📺 MoviePilot 订阅助手
 
-**可用命令**
+可用命令
+• /sub 片名    搜索并订阅电影或电视剧
+• /download    查看当前下载任务
+• /mp_help     查看本帮助
 
-- `/sub <片名>` — 搜索并订阅影片（支持电影和电视剧），示例：`/sub 星际穿越`
-- `/download` — 查看当前下载进度
-- `/mp_help` — 显示本帮助信息
-
-**使用提示**
-
-- 搜索后回复序号进行订阅，回复 `0` 取消操作
-- 电视剧会自动列出可选季度
-- 搜索超时时间为 60 秒
-"""
+使用说明
+• 搜索后回复序号选择影片
+• 电视剧随后回复季数
+• 回复 0 可取消，选择等待 60 秒"""
         yield self._md(event, help_text)
+
+    @staticmethod
+    def _session_key(event: AstrMessageEvent) -> str:
+        return f"{event.unified_msg_origin}:{event.get_sender_id()}"
 
     @filter.command("sub")
     async def subscribe(self, event: AstrMessageEvent, message: str):
@@ -116,6 +110,7 @@ class MoviePilotPlugin(Star):
 
         media_name = message.strip()
         user_id = event.get_sender_id()
+        session_key = self._session_key(event)
         logger.info(f"用户 {user_id} 搜索影片: {media_name}")
 
         # 搜索影片
@@ -127,13 +122,13 @@ class MoviePilotPlugin(Star):
             return
 
         if not movies:
-            yield self._md(event, f'🔍 未找到与 **{media_name}** 相关的影片，请尝试其他关键词。')
+            yield self._md(event, f"🔍 没有找到“{media_name}”，试试其他关键词吧。")
             return
 
         # 显示搜索结果
         result_lines = [
-            "## 🔍 搜索结果",
-            f"共找到 **{len(movies)}** 部相关影片：",
+            f"🔎 搜索结果  ·  共 {len(movies)} 部",
+            "────────────────",
             "",
         ]
         for i, movie in enumerate(movies, 1):
@@ -143,63 +138,66 @@ class MoviePilotPlugin(Star):
             type_icon = "🎬" if media_type == "电影" else "📺"
             year_str = f" ({year})" if year else ""
             link = self._media_link(movie)
+            result_lines.append(f"{i}. {type_icon} {title}{year_str}")
             if link:
-                result_lines.append(f"{i}. {type_icon} [{title}{year_str}]({link})")
-            else:
-                result_lines.append(f"{i}. {type_icon} **{title}**{year_str}")
+                result_lines.append(f"   TMDB：{link}")
 
         result_lines.extend([
             "",
-            "> 💡 回复序号订阅（点击片名可查看 TMDB 详情区分同名影片），回复 `0` 取消",
+            "回复序号选择影片，回复 0 取消",
         ])
         result_text = "\n".join(result_lines)
+        await self._set_user_state(
+            session_key,
+            {
+                "movies": movies,
+                "waiting_for": "movie",
+                "expires_at": time.monotonic() + 60,
+            },
+        )
         yield self._md(event, result_text)
 
-        # 启动会话等待用户选择
-        await self._wait_for_movie_selection(event, movies)
-
-    async def _wait_for_movie_selection(self, event: AstrMessageEvent, movies: list[dict]) -> None:
-        """
-        等待用户选择影片
-
-        Args:
-            event: 原始消息事件
-            movies: 影片列表
-        """
-        user_id = event.get_sender_id()
-
-        @session_waiter(timeout=60, record_history_chains=False)
-        async def selection_waiter(controller: SessionController, ev: AstrMessageEvent):
-            user_input = ev.message_str.strip()
-            current_state = await self._get_user_state(user_id)
-
-            # 处理季度选择状态
-            if current_state.get("waiting_for") == "season":
-                await self._process_season_selection(ev, controller, user_id, user_input)
-                return
-
-            # 处理影片选择
-            await self._process_movie_index_selection(ev, controller, user_id, user_input, movies)
-
-        try:
-            await selection_waiter(event)
-        except TimeoutError:
-            await event.send(self._md(event, "⏰ 操作超时，已退出选择。"))
-        except Exception as e:
-            logger.error(f"会话处理异常: {e}")
-            await event.send(self._md(event, "❌ 发生错误，请重新尝试。"))
-        finally:
-            await self._clear_user_state(user_id)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=999)
+    async def on_selection_reply(self, event: AstrMessageEvent):
+        session_key = self._session_key(event)
+        state = await self._get_user_state(session_key)
+        if not state:
+            return
+        if (event.message_str or "").lstrip().startswith(("/", "／")):
+            return
+        if time.monotonic() >= state.get("expires_at", 0):
+            await self._clear_user_state(session_key)
             event.stop_event()
+            yield self._md(event, "⏰ 操作超时，请重新搜索影片。")
+            return
+
+        user_input = (event.message_str or "").strip()
+        event.stop_event()
+        try:
+            if state.get("waiting_for") == "season":
+                keep_waiting = await self._process_season_selection(
+                    event, session_key, user_input
+                )
+            else:
+                keep_waiting = await self._process_movie_index_selection(
+                    event, session_key, user_input, state.get("movies", [])
+                )
+            if keep_waiting:
+                await self._refresh_user_state_expiry(session_key)
+            else:
+                await self._clear_user_state(session_key)
+        except Exception as e:
+            logger.exception(f"会话处理异常: {e}")
+            await self._clear_user_state(session_key)
+            yield self._md(event, "❌ 发生错误，请重新搜索影片。")
 
     async def _process_movie_index_selection(
         self,
         event: AstrMessageEvent,
-        controller: SessionController,
         user_id: str,
         user_input: str,
         movies: list[dict],
-    ) -> None:
+    ) -> bool:
         """
         处理影片索引选择
 
@@ -215,38 +213,35 @@ class MoviePilotPlugin(Star):
             index = int(user_input) - 1
         except ValueError:
             await event.send(self._md(event, "⚠️ 请输入有效的数字序号。"))
-            controller.keep(timeout=60, reset_timeout=True)
-            return
+            return True
 
         # 用户取消
         if index == -1:
             await event.send(self._md(event, "❌ 已取消操作。"))
-            controller.stop()
-            return
+            return False
 
         # 验证索引范围
         if not (0 <= index < len(movies)):
             await event.send(self._md(event, "⚠️ 无效的序号，请输入列表中的数字。"))
-            controller.keep(timeout=60, reset_timeout=True)
-            return
+            return True
 
         selected_movie = movies[index]
         logger.info(f"用户 {user_id} 选择了: {selected_movie.get('title')}")
 
         # 处理电视剧
         if selected_movie.get("type") == "电视剧":
-            await self._handle_tv_series_selection(event, controller, user_id, selected_movie)
+            return await self._handle_tv_series_selection(event, user_id, selected_movie)
         else:
             # 处理电影订阅
-            await self._subscribe_movie(event, controller, selected_movie)
+            await self._subscribe_movie(event, selected_movie)
+            return False
 
     async def _handle_tv_series_selection(
         self,
         event: AstrMessageEvent,
-        controller: SessionController,
         user_id: str,
         movie: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         """
         处理电视剧选择，获取并显示季度列表
 
@@ -260,8 +255,7 @@ class MoviePilotPlugin(Star):
         if not tmdb_id or str(tmdb_id) in ("tv", "movie"):
             logger.warning(f"电视剧缺少有效的 TMDB ID: {tmdb_id}")
             await event.send(self._md(event, "❌ 影片信息不完整，无法获取季度信息。\n这可能是因为该影片缺少 TMDB 信息，建议直接尝试订阅。"))
-            controller.stop()
-            return
+            return False
 
         # 获取季度列表
         try:
@@ -269,35 +263,36 @@ class MoviePilotPlugin(Star):
         except Exception as e:
             logger.error(f"获取季度列表失败: {e}")
             await event.send(self._md(event, "❌ 无法获取季度信息，请稍后重试。"))
-            controller.stop()
-            return
+            return False
 
         if not seasons:
             await event.send(self._md(event, "❌ 没有找到可用的季度信息。"))
-            controller.stop()
-            return
+            return False
 
         # 显示季度列表
         title = movie.get("title", "未知")
         link = self._media_link(movie)
-        header = f"## 📺 [{title}]({link})" if link else f"## 📺 {title}"
+        year = movie.get("year", "")
+        header = f"📺 {title} ({year})" if year else f"📺 {title}"
         result_lines = [
             header,
-            "**请选择要订阅的季度：**",
-            "",
+            "请选择要订阅的季度：",
         ]
+        if link:
+            result_lines.append(f"TMDB：{link}")
+        result_lines.append("")
         for s in seasons:
             season_num = s.get("season_number", "?")
             season_name = s.get("name", "未命名")
             # 如果名称就是"第 X 季"，就不重复显示
             if season_name == f"第 {season_num} 季":
-                result_lines.append(f"- 🔹 第 {season_num} 季")
+                result_lines.append(f"{season_num}. 第 {season_num} 季")
             else:
-                result_lines.append(f"- 🔹 第 {season_num} 季｜{season_name}")
+                result_lines.append(f"{season_num}. 第 {season_num} 季  ·  {season_name}")
 
         result_lines.extend([
             "",
-            "> 💡 回复季数数字即可订阅，回复 `0` 退出",
+            "回复季数订阅，回复 0 取消",
         ])
         result_text = "\n".join(result_lines)
         await event.send(self._md(event, result_text))
@@ -309,18 +304,18 @@ class MoviePilotPlugin(Star):
                 "selected_movie": movie,
                 "seasons": seasons,
                 "waiting_for": "season",
+                "expires_at": time.monotonic() + 60,
             },
         )
 
-        controller.keep(timeout=60, reset_timeout=True)
+        return True
 
     async def _process_season_selection(
         self,
         event: AstrMessageEvent,
-        controller: SessionController,
         user_id: str,
         user_input: str,
-    ) -> None:
+    ) -> bool:
         """
         处理季度选择
 
@@ -334,14 +329,12 @@ class MoviePilotPlugin(Star):
             season_number = int(user_input)
         except ValueError:
             await event.send(self._md(event, "⚠️ 请输入有效的季数。"))
-            controller.keep(timeout=60, reset_timeout=True)
-            return
+            return True
 
         # 用户取消
         if season_number == 0:
             await event.send(self._md(event, "❌ 已取消操作。"))
-            controller.stop()
-            return
+            return False
 
         # 获取用户状态
         state = await self._get_user_state(user_id)
@@ -350,15 +343,13 @@ class MoviePilotPlugin(Star):
 
         if not selected_movie or not seasons:
             await event.send(self._md(event, "❌ 会话已过期，请重新搜索。"))
-            controller.stop()
-            return
+            return False
 
         # 验证季度有效性
         valid_season = any(s.get("season_number") == season_number for s in seasons)
         if not valid_season:
             await event.send(self._md(event, "⚠️ 无效的季数，请从列表中选择。"))
-            controller.keep(timeout=60, reset_timeout=True)
-            return
+            return True
 
         # 执行订阅
         logger.info(f"用户 {user_id} 订阅季度: {selected_movie.get('title')} 第{season_number}季")
@@ -367,32 +358,32 @@ class MoviePilotPlugin(Star):
         except Exception as e:
             logger.error(f"订阅电视剧失败: {e}")
             await event.send(self._md(event, "❌ 订阅服务暂时不可用，请稍后重试。"))
-            controller.stop()
-            return
+            return False
 
         if success:
             title = selected_movie.get("title")
             year = selected_movie.get("year")
             title_str = f"{title} ({year})" if year else title
             link = self._media_link(selected_movie)
+            title_lines = [f"片名：{title_str}"]
             if link:
-                title_str = f"[{title_str}]({link})"
-            result_text = (
-                "## ✅ 订阅成功\n"
-                f"- 类型：电视剧\n"
-                f"- 片名：{title_str}\n"
-                f"- 季度：第 {season_number} 季"
-            )
+                title_lines.append(f"TMDB：{link}")
+            result_text = "\n".join([
+                "✅ 订阅成功",
+                "────────────────",
+                "类型：电视剧",
+                *title_lines,
+                f"季度：第 {season_number} 季",
+            ])
         else:
-            result_text = "❌ 订阅失败，请检查 MoviePilot 服务状态或稍后重试。"
+            result_text = "❌ 订阅失败，请检查 MoviePilot 服务后重试。"
 
         await event.send(self._md(event, result_text))
-        controller.stop()
+        return False
 
     async def _subscribe_movie(
         self,
         event: AstrMessageEvent,
-        controller: SessionController,
         movie: dict[str, Any],
     ) -> None:
         """
@@ -408,7 +399,6 @@ class MoviePilotPlugin(Star):
         except Exception as e:
             logger.error(f"订阅电影失败: {e}")
             await event.send(self._md(event, "❌ 订阅服务暂时不可用，请稍后重试。"))
-            controller.stop()
             return
 
         if success:
@@ -416,18 +406,19 @@ class MoviePilotPlugin(Star):
             year = movie.get("year")
             title_str = f"{title} ({year})" if year else title
             link = self._media_link(movie)
+            title_lines = [f"片名：{title_str}"]
             if link:
-                title_str = f"[{title_str}]({link})"
-            result_text = (
-                "## ✅ 订阅成功\n"
-                f"- 类型：电影\n"
-                f"- 片名：{title_str}"
-            )
+                title_lines.append(f"TMDB：{link}")
+            result_text = "\n".join([
+                "✅ 订阅成功",
+                "────────────────",
+                "类型：电影",
+                *title_lines,
+            ])
         else:
-            result_text = "❌ 订阅失败，请检查 MoviePilot 服务状态或稍后重试。"
+            result_text = "❌ 订阅失败，请检查 MoviePilot 服务后重试。"
 
         await event.send(self._md(event, result_text))
-        controller.stop()
 
     async def _get_user_state(self, user_id: str) -> dict[str, Any]:
         """获取用户状态（线程安全）"""
@@ -443,6 +434,13 @@ class MoviePilotPlugin(Star):
         """清除用户状态（线程安全）"""
         async with self.state_lock:
             self.state.pop(user_id, None)
+
+    async def _refresh_user_state_expiry(self, user_id: str) -> None:
+        """无效输入后延长交互时限。"""
+        async with self.state_lock:
+            state = self.state.get(user_id)
+            if state:
+                state["expires_at"] = time.monotonic() + 60
 
     @filter.command("download")
     async def show_download_progress(self, event: AstrMessageEvent):
@@ -468,10 +466,14 @@ class MoviePilotPlugin(Star):
             yield self._md(event, "📭 当前没有正在下载的任务。")
             return
 
-        # 格式化下载进度
-        result_lines = [f"## 📥 当前下载任务（{len(progress_data)} 个）", ""]
+        # 用纯文本分组展示下载进度，避免 Markdown 在不同平台呈现不一致。
+        result_lines = [
+            f"📥 当前下载任务（{len(progress_data)} 个）",
+            "────────────────",
+            "",
+        ]
 
-        for task in progress_data:
+        for index, task in enumerate(progress_data, 1):
             media = task.get("media", {})
             title = media.get("title") or task.get("title", "未知")
             season = media.get("season", "")
@@ -495,16 +497,16 @@ class MoviePilotPlugin(Star):
             }.get(state.lower(), "❓")
 
             # 格式化任务信息
-            task_line = f"- {state_icon} **{title}**"
+            task_line = f"{index}. {state_icon} {title}"
             if season:
                 task_line += f" {season}"
             if episode:
                 task_line += f" {episode}"
 
             result_lines.append(task_line)
-            result_lines.append(f"  `[{bar}]` **{progress:.1f}%**")
+            result_lines.append(f"   进度：{progress:.1f}%  [{bar}]")
             if speed:
-                result_lines.append(f"  💨 {speed}")
+                result_lines.append(f"   速度：{speed}")
             result_lines.append("")
 
         yield self._md(event, "\n".join(result_lines))
